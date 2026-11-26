@@ -16,7 +16,7 @@ use hbb_common::{
         register_pk_response::Result::{TOO_FREQUENT, UUID_MISMATCH},
         *,
     },
-    tcp::{listen_any, FramedStream},
+    tcp::{listen_any, Encrypt, FramedStream},
     timeout,
     tokio::{
         self,
@@ -51,7 +51,10 @@ const REG_TIMEOUT: i64 = 30_000;
 type TcpStreamSink = SplitSink<Framed<TcpStream, BytesCodec>, Bytes>;
 type WsSink = SplitSink<tokio_tungstenite::WebSocketStream<TcpStream>, tungstenite::Message>;
 enum Sink {
-    TcpStream(TcpStreamSink),
+    /// The sending half of a 21116 TCP connection, with its encryption state once the client
+    /// answered the key exchange (see `secure_tcp`). Every frame sent through it, also later
+    /// from another connection's task via `tcp_punch`, is sealed with that state.
+    TcpStream(TcpStreamSink, Option<Encrypt>),
     Ws(WsSink),
 }
 type Sender = mpsc::UnboundedSender<Data>;
@@ -823,7 +826,8 @@ impl RendezvousServer {
         if let Some(sink) = sink.as_mut() {
             if let Ok(bytes) = msg.write_to_bytes() {
                 match sink {
-                    Sink::TcpStream(s) => {
+                    Sink::TcpStream(s, enc) => {
+                        let bytes = crate::secure_tcp::seal(enc.as_mut(), bytes);
                         allow_err!(s.send(Bytes::from(bytes)).await);
                     }
                     Sink::Ws(ws) => {
@@ -1177,9 +1181,43 @@ impl RendezvousServer {
                 }
             }
         } else {
-            let (a, mut b) = Framed::new(stream, BytesCodec::new()).split();
-            sink = Some(Sink::TcpStream(a));
-            while let Ok(Some(Ok(bytes))) = timeout(30_000, b.next()).await {
+            let (mut a, mut b) = Framed::new(stream, BytesCodec::new()).split();
+            // Offer the key exchange first, in clear. A client that wants it waits for this
+            // frame; one that does not sends its request first and skips this frame when it
+            // reads. The client's first frame decides which of the two the connection is.
+            let mut offer = None;
+            if let Some(sk) = self.inner.sk.as_ref() {
+                let (hello, o) = crate::secure_tcp::offer(sk);
+                if let Ok(hello) = hello.write_to_bytes() {
+                    if a.send(Bytes::from(hello)).await.is_ok() {
+                        offer = Some(o);
+                    }
+                }
+            }
+            sink = Some(Sink::TcpStream(a, None));
+            let mut dec: Option<Encrypt> = None;
+            while let Ok(Some(Ok(mut bytes))) = timeout(30_000, b.next()).await {
+                if let Some(o) = offer.take() {
+                    match o.first_frame(&bytes) {
+                        Ok(crate::secure_tcp::FirstFrame::Secured(enc)) => {
+                            log::debug!("Tcp connection from {:?} secured", addr);
+                            dec = Some(enc.clone());
+                            if let Some(Sink::TcpStream(_, sink_enc)) = sink.as_mut() {
+                                *sink_enc = Some(enc);
+                            }
+                            continue;
+                        }
+                        Ok(crate::secure_tcp::FirstFrame::Plain) => {}
+                        Err(err) => {
+                            log::warn!("Key exchange with {:?} failed: {}", addr, err);
+                            break;
+                        }
+                    }
+                }
+                if let Err(err) = crate::secure_tcp::open(dec.as_mut(), &mut bytes) {
+                    log::warn!("Tcp frame from {:?} not decrypted: {}", addr, err);
+                    break;
+                }
                 if !self.handle_tcp(&bytes, &mut sink, addr, key, ws).await {
                     break;
                 }
