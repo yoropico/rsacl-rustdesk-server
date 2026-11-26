@@ -1,3 +1,8 @@
+rustdesk-server (1.1.16+rsacl1) UNRELEASED; urgency=medium
+
+  * hbbs: server side of the rendezvous key exchange on TCP 21116, so RustDesk
+    clients that are logged in (or carry a switch code or WebRTC offer) connect
+
 rustdesk-server (1.1.16) UNRELEASED; urgency=medium
 
   * Fix i32 overflow: peers offline 24.9–49.7 days wrongly reported online #676

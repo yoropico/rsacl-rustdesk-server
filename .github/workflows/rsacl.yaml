@@ -1,0 +1,94 @@
+name: rsacl
+
+# The rsacl fork's own gate and package: tests on every PR to rsacl, and the Linux amd64
+# binaries plus debs built exactly as upstream's build.yaml builds them (musl via cross,
+# toolchain 1.90, debuild from debian/), so infra-cmdb can swap hbbs on the server.
+
+permissions:
+  contents: read
+
+on:
+  pull_request:
+    branches: [rsacl]
+  push:
+    branches: [rsacl]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+
+      - name: Unit tests of the key exchange
+        run: cargo test --lib secure_tcp
+
+      - name: hbbs integration tests (logged in, logged out, old client)
+        run: cargo test --test secure_tcp
+
+  package-amd64:
+    name: Build and package - amd64
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.90"
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build
+        run: cross build --release --all-features --target=x86_64-unknown-linux-musl
+
+      - name: Create packaging env
+        run: |
+          sudo apt update
+          DEBIAN_FRONTEND=noninteractive sudo apt install -y devscripts build-essential debhelper pkg-config
+          mkdir -p debian-build/amd64/bin
+          cp -v target/x86_64-unknown-linux-musl/release/{hbbs,hbbr,rustdesk-utils} debian-build/amd64/bin/
+          chmod -v a+x debian-build/amd64/bin/*
+
+      - name: Build package
+        run: |
+          cp -vr debian systemd debian-build/amd64/
+          cat debian/control.tpl | sed 's/{{ ARCH }}/amd64/' > debian-build/amd64/debian/control
+          cd debian-build/amd64/
+          debuild -i -us -uc -b -aamd64
+
+      - name: Checksums
+        run: |
+          cd debian-build
+          sha256sum amd64/bin/hbbs rustdesk-server-hbbs_*_amd64.deb | tee SHA256SUMS
+          dpkg-deb -c rustdesk-server-hbbs_*_amd64.deb
+          dpkg-deb -I rustdesk-server-hbbs_*_amd64.deb
+
+      - name: Publish artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsacl-hbbs-linux-amd64
+          path: |
+            debian-build/amd64/bin/hbbs
+            debian-build/rustdesk-server-hbbs_*_amd64.deb
+            debian-build/SHA256SUMS
+          if-no-files-found: error
